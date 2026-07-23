@@ -40,7 +40,6 @@ class Args:
     """whether to upload the saved model to huggingface"""
     hf_entity: str = ""
     """the user or org name of the model repository from the Hugging Face Hub"""
-
     # Algorithm specific arguments
     env_id: str = "CartPole-v1"
     """the id of the environment"""
@@ -91,10 +90,13 @@ def make_env(env_id, seed, idx, capture_video, run_name):
 class QNetwork(nn.Module):
     def __init__(self, env):
         super().__init__()
+        # Changed to more and larger hidden layers
         self.network = nn.Sequential(
-            nn.Linear(np.array(env.single_observation_space.shape).prod(), 120),
+            nn.Linear(np.array(env.single_observation_space.shape).prod(), 128),
             nn.ReLU(),
-            nn.Linear(120, 84),
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.Linear(128, 84),
             nn.ReLU(),
             nn.Linear(84, env.single_action_space.n),
         )
