@@ -3,6 +3,7 @@ import os
 import random
 import time
 from dataclasses import dataclass
+from functools import partial  # [FORK CHANGE] used to pass q_hidden_sizes to evaluate()
 
 import gymnasium as gym
 import numpy as np
@@ -69,6 +70,16 @@ class Args:
     """timestep to start learning"""
     train_frequency: int = 10
     """the frequency of training"""
+    # [FORK CHANGE] Configurable Q-network size. The vanilla (120, 84) MLP was tuned for
+    # CartPole (4-dim obs, 2 actions); the OGBench scene env (40-dim obs, 64+ chunk actions)
+    # needs more capacity. Default keeps the vanilla architecture.
+    q_hidden_sizes: tuple[int, ...] = (120, 84)
+    """the hidden layer sizes of the Q-network"""
+    # [FORK CHANGE] Huber instead of MSE TD loss. With dense negative rewards Q-values reach
+    # ~ r / (1 - gamma) (e.g. -300), and MSE then yields large, noisy gradients.
+    # Default keeps the vanilla MSE loss.
+    huber_loss: bool = False
+    """whether to use the Huber (smooth L1) TD loss instead of MSE"""
 
 
 def make_env(env_id, seed, idx, capture_video, run_name):
@@ -88,18 +99,17 @@ def make_env(env_id, seed, idx, capture_video, run_name):
 
 # ALGO LOGIC: initialize agent here:
 class QNetwork(nn.Module):
-    def __init__(self, env):
+    # [FORK CHANGE] Hidden layers are built from `hidden_sizes` (see Args.q_hidden_sizes)
+    # instead of the hardcoded CartPole MLP, so the network can be sized per env and swept.
+    def __init__(self, env, hidden_sizes: tuple[int, ...] = (120, 84)):
         super().__init__()
-        # Changed to more and larger hidden layers
-        self.network = nn.Sequential(
-            nn.Linear(np.array(env.single_observation_space.shape).prod(), 128),
-            nn.ReLU(),
-            nn.Linear(128, 128),
-            nn.ReLU(),
-            nn.Linear(128, 84),
-            nn.ReLU(),
-            nn.Linear(84, env.single_action_space.n),
-        )
+        layers = []
+        in_dim = int(np.array(env.single_observation_space.shape).prod())
+        for hidden_dim in hidden_sizes:
+            layers += [nn.Linear(in_dim, hidden_dim), nn.ReLU()]
+            in_dim = hidden_dim
+        layers.append(nn.Linear(in_dim, env.single_action_space.n))
+        self.network = nn.Sequential(*layers)
 
     def forward(self, x):
         return self.network(x)
@@ -146,9 +156,10 @@ if __name__ == "__main__":
     )
     assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
-    q_network = QNetwork(envs).to(device)
+    # [FORK CHANGE] pass the configurable hidden sizes
+    q_network = QNetwork(envs, args.q_hidden_sizes).to(device)
     optimizer = optim.Adam(q_network.parameters(), lr=args.learning_rate)
-    target_network = QNetwork(envs).to(device)
+    target_network = QNetwork(envs, args.q_hidden_sizes).to(device)
     target_network.load_state_dict(q_network.state_dict())
 
     rb = ReplayBuffer(
@@ -181,6 +192,10 @@ if __name__ == "__main__":
                     print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
                     writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
                     writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
+                    # [FORK CHANGE] Log task success at episode end. The return alone does not show
+                    # whether a goal-based task (e.g. OGBench, info["success"]) was actually solved.
+                    if "success" in info:
+                        writer.add_scalar("charts/episodic_success", float(info["success"]), global_step)
 
         # TRY NOT TO MODIFY: save data to reply buffer; handle `final_observation`
         real_next_obs = next_obs.copy()
@@ -200,7 +215,11 @@ if __name__ == "__main__":
                     target_max, _ = target_network(data.next_observations).max(dim=1)
                     td_target = data.rewards.flatten() + args.gamma * target_max * (1 - data.dones.flatten())
                 old_val = q_network(data.observations).gather(1, data.actions).squeeze()
-                loss = F.mse_loss(td_target, old_val)
+                # [FORK CHANGE] optional Huber loss, see Args.huber_loss
+                if args.huber_loss:
+                    loss = F.smooth_l1_loss(old_val, td_target)
+                else:
+                    loss = F.mse_loss(td_target, old_val)
 
                 if global_step % 100 == 0:
                     writer.add_scalar("losses/td_loss", loss, global_step)
@@ -232,7 +251,9 @@ if __name__ == "__main__":
             args.env_id,
             eval_episodes=10,
             run_name=f"{run_name}-eval",
-            Model=QNetwork,
+            # [FORK CHANGE] evaluate() builds Model(envs); bind the hidden sizes so the
+            # saved state_dict matches the evaluated network architecture
+            Model=partial(QNetwork, hidden_sizes=args.q_hidden_sizes),
             device=device,
             epsilon=args.end_e,
         )
